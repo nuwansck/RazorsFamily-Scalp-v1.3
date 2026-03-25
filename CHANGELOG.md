@@ -2,6 +2,70 @@
 
 ---
 
+## v1.4.0 — 2026-03-25
+
+### 🔴 New — Consecutive SL Direction Block (`bot.py`)
+
+**Problem:** On choppy/trending days the bot repeatedly enters the same direction
+and hits SL each time. Example: Mar 24 had 3 consecutive SELL SLs in a row —
+gold was rising but EMA lag kept signalling SELL. Mar 25 had 2 consecutive BUY
+SLs as gold reversed. These cost ~$35–50 in preventable losses per bad day.
+
+**Fix:** After `consecutive_sl_block_count` (default 2) consecutive SLs in the
+same direction, that direction is blocked for `consecutive_sl_block_minutes`
+(default 60 minutes). The opposite direction can still trade if a fresh signal
+fires — this is the key difference from the existing `loss_streak_cooldown`
+which blocks all directions.
+
+```
+Example — Mar 24:
+  20:13  SELL SL  → streak=1, allow
+  21:35  SELL SL  → streak=2, BLOCK SELL until 22:35
+  21:52  SELL signal → SKIPPED_DIRECTION_BLOCK ← saves $17.51
+```
+
+**New settings keys (both fully parameterized):**
+```json
+"consecutive_sl_block_count":   2,
+"consecutive_sl_block_minutes": 60
+```
+
+**Log signature:** `SKIPPED_DIRECTION_BLOCK`
+
+**Telegram message:** `🚫 SELL direction blocked — 2 consecutive SELL SLs. Resuming in 43 min.`
+
+**New function in `bot.py`:** `consecutive_sl_direction_streak(history, today_str, direction)`
+counts trailing same-direction SLs at the tail of today's closed trades. Resets
+to 0 as soon as a TP or different-direction trade appears.
+
+### 🟡 Change — London Session Threshold Raised 4 → 5 (`settings.json`)
+
+**Problem:** London session WR across 3 separate sessions: 38% (Mar 20),
+25% (Mar 24), 0% (Mar 25). US session consistently outperformed London.
+
+**Fix:** London now requires score ≥ 5 instead of ≥ 4. At score 5 a Fresh EMA
+Cross **and** ORB break must both be present — EMA trend alone no longer
+qualifies in London. US session remains at threshold 4.
+
+```json
+"session_thresholds": { "London": 5, "US": 4 }
+```
+
+**Trade-off:** Fewer London trades. Some valid setups will be skipped.
+Accepted because the 3-session data consistently shows London quality at
+threshold 4 is insufficient.
+
+### ✅ No Other Changes
+
+All v1.3 fixes carry forward unchanged:
+- ORB time decay (orb_fresh=60min, orb_aging=120min)
+- SL reentry gap 10 minutes
+- Telegram header reads bot_name from settings
+- All 65 settings.json keys fully parameterized
+- Zero hardcoded values in signal logic
+
+---
+
 ## v1.3.0 — 2026-03-23
 
 ### 🔴 Fix — Telegram Header Showed Wrong Version (`telegram_alert.py`)

@@ -182,6 +182,9 @@ def validate_settings(settings: dict) -> dict:
     settings.setdefault("news_medium_penalty_score", -1)
     settings.setdefault("fixed_tp_usd",             None)  # used when tp_mode = "fixed_usd"
     settings.setdefault("loss_streak_cooldown_min",  30)
+
+    settings.setdefault("consecutive_sl_block_count",   2)   # v1.4: direction block
+    settings.setdefault("consecutive_sl_block_minutes", 60)  # v1.4: direction block duration
     # v1.2.6: ORB decay + parameterized signal engine values
     settings.setdefault("orb_fresh_minutes",         60)
     settings.setdefault("orb_aging_minutes",         120)
@@ -388,6 +391,39 @@ def consecutive_loss_streak_today(history: list, today_str: str) -> int:
         if pnl < 0:
             streak += 1
         else:
+            break
+    return streak
+
+
+def consecutive_sl_direction_streak(history: list, today_str: str, direction: str) -> int:
+    """Count consecutive SL losses in the given direction at the tail of today's closed trades.
+
+    Used by the v1.4 direction block guard: after N consecutive SLs in the
+    same direction, that direction is blocked for a configurable cool-down
+    period so the bot stops fighting a sustained directional move.
+
+    Args:
+        history:    Full trade history list.
+        today_str:  Trading day string (YYYY-MM-DD) — respects 08:00 SGT reset.
+        direction:  "BUY" or "SELL" — only SLs in this direction are counted.
+
+    Returns:
+        Number of consecutive tail-end SLs for the given direction (0 if the
+        most recent closed trade in that direction was a TP, or no trades yet).
+    """
+    streak = 0
+    for t in reversed(get_closed_trade_records_today(history, today_str)):
+        pnl = t.get("realized_pnl_usd")
+        if not isinstance(pnl, (int, float)):
+            continue
+        t_dir = (t.get("direction") or "").upper()
+        if t_dir != direction.upper():
+            # Different direction — stop counting; streak is directional
+            break
+        if pnl < 0:
+            streak += 1
+        else:
+            # TP in this direction — streak resets
             break
     return streak
 
@@ -1318,6 +1354,76 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
         update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"), status="SKIPPED_TRADE_GOLD_DISABLED")
         db.finish_cycle(run_id, status="SKIPPED", summary={"stage": "trade_switch"})
         return None
+
+    # ── Consecutive SL direction block (v1.4) ────────────────────────────────
+    # After N consecutive SLs in the same direction, block that direction for
+    # a configurable window. This prevents the bot from repeatedly fighting a
+    # sustained directional move (e.g. selling into a rising gold market).
+    #
+    # Key difference vs loss_streak_cooldown: that guard blocks ALL directions
+    # after any 2 losses. This guard only blocks the specific losing direction —
+    # the opposite direction can still trade if a valid signal fires.
+    #
+    # Runs post-signal so direction is known and score has passed the threshold.
+    # Settings: consecutive_sl_block_count (default 2)
+    #           consecutive_sl_block_minutes (default 60)
+    _dir_block_count = int(settings.get("consecutive_sl_block_count", 2))
+    _dir_block_min   = int(settings.get("consecutive_sl_block_minutes", 60))
+    if _dir_block_count > 0 and _dir_block_min > 0 and direction not in (None, "NONE"):
+        _signal_dir = direction.upper()
+        _dir_streak = consecutive_sl_direction_streak(history, today, _signal_dir)
+        if _dir_streak >= _dir_block_count:
+            _rt_state    = load_json(RUNTIME_STATE_FILE, {})
+            _block_key   = f"dir_block_{_signal_dir.lower()}"
+            _block_until = _parse_sgt_timestamp(_rt_state.get(f"{_block_key}_until"))
+
+            _last_closed = get_closed_trade_records_today(history, today)
+            _trigger_id  = (
+                _last_closed[-1].get("trade_id")
+                or _last_closed[-1].get("closed_at_sgt")
+            ) if _last_closed else None
+
+            # Set block window if not already set for this streak trigger
+            if _rt_state.get(f"{_block_key}_trigger") != _trigger_id:
+                _block_until = now_sgt + timedelta(minutes=_dir_block_min)
+                save_json(RUNTIME_STATE_FILE, {
+                    **_rt_state,
+                    f"{_block_key}_trigger": _trigger_id,
+                    f"{_block_key}_until":   _block_until.strftime("%Y-%m-%d %H:%M:%S"),
+                    "updated_at_sgt":        now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                log.info(
+                    "Direction block set: %s blocked until %s (%d consecutive SLs).",
+                    _signal_dir, _block_until.strftime("%H:%M SGT"), _dir_streak,
+                    extra={"run_id": run_id},
+                )
+
+            if _block_until and now_sgt < _block_until:
+                _remaining = max(1, int((_block_until - now_sgt).total_seconds() // 60))
+                msg = (
+                    f"🚫 {_signal_dir} direction blocked — {_dir_streak} consecutive "
+                    f"{_signal_dir} SLs. Resuming in {_remaining} min."
+                )
+                send_once_per_state(
+                    alert, ops, f"dir_block_{_signal_dir.lower()}_state",
+                    f"dir_block:{_signal_dir}:{_trigger_id}", msg,
+                )
+                log.info(
+                    "Direction block active: %s blocked %d more min (%d/%d SLs).",
+                    _signal_dir, _remaining, _dir_streak, _dir_block_count,
+                    extra={"run_id": run_id},
+                )
+                update_runtime_state(
+                    last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                    status="SKIPPED_DIRECTION_BLOCK",
+                )
+                db.finish_cycle(run_id, status="SKIPPED", summary={
+                    "stage":     "direction_block",
+                    "direction": _signal_dir,
+                    "streak":    _dir_streak,
+                    "block_min": _dir_block_min,
+                })
+                return None
 
     # ── Position sizing ───────────────────────────────────────────────────────
     entry = levels.get("entry", 0)
