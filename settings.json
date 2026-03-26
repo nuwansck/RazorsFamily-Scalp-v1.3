@@ -56,7 +56,7 @@
   "telegram_show_margin": true,
   "xau_margin_rate_override": 0.05,
   "trading_day_start_hour_sgt": 8,
-  "max_losing_trades_session": 2,
+  "max_losing_trades_session": 4,
   "exhaustion_atr_mult": 3.0,
   "orb_fresh_minutes": 60,
   "orb_aging_minutes": 120,
@@ -74,5 +74,5 @@
   "atr_period": 14,
   "m5_candle_count": 40,
   "consecutive_sl_block_count": 2,
-  "consecutive_sl_block_minutes": 90
+  "consecutive_sl_block_minutes": 60
 }
