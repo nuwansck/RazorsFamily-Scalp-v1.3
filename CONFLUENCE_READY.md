@@ -1,22 +1,25 @@
-# RF Scalp v1.3 — Technical Specification & Operations Wiki
+# RF Scalp v1.6 — Technical Specification & Operations Wiki
 
-**Bot Name:** RF Scalp v1.3
+**Bot Name:** RF Scalp v1.6
 **Instrument:** XAU/USD (Gold)
 **Exchange:** OANDA (practice & live)
 **Deployment:** Railway (PaaS)
-**Signal Timeframe:** M5 (5-minute candles)
-**Cycle Interval:** Every 5 minutes
+**Signal Timeframe:** M15 (15-minute candles)
+**Cycle Interval:** Every 15 minutes
 **Status:** Demo mode (switch `demo_mode: false` for live)
 
 ---
 
 ## 1. Purpose & Scope
 
-RF Scalp v1.3 is a fully automated 5-minute scalping bot for XAU/USD (Gold).
-It was forked from RF v2.4 (CPR breakout) and replaces the signal engine with a
-three-layer scalping approach: EMA crossover, Opening Range Breakout, and CPR bias.
-All infrastructure — Railway deployment, OANDA order execution, Telegram alerts,
-news filtering, database, and reporting — is inherited from RF v2.4 without change.
+RF Scalp v1.6 is a fully automated gold scalping bot for XAU/USD. It was forked from RF v2.4
+(CPR breakout) and uses a four-layer signal engine: H1 trend filter, EMA 9/21 crossover on M15,
+Opening Range Breakout, and CPR pivot bias. All infrastructure — Railway deployment, OANDA order
+execution, Telegram alerts, news filtering, database, and reporting — is inherited from RF v2.4.
+
+v1.6 specifically addresses the low London win rates observed in v1.4–v1.5 (38% → 25% → 0%
+across three sessions) by adding two pre-score hard blocks, upgrading the signal candle from
+M5 to M15, and tightening session and daily trade caps.
 
 This document covers strategy logic, signal engine internals, configuration, deployment,
 operations, and troubleshooting.
@@ -26,17 +29,19 @@ operations, and troubleshooting.
 ## 2. Architecture Overview
 
 ```
-scheduler.py  (APScheduler — every 5 min)
+scheduler.py  (APScheduler — every 15 min)
       |
       v
 bot.py  run_bot_cycle()
       |
       +---> session check (London / US / dead zone)
       +---> news_filter.py (economic calendar)
-      +---> signals.py  SignalEngine.analyze()   <--- CHANGED from v2.4
+      +---> signals.py  SignalEngine.analyze()
       |         |
-      |         +-- Layer 1: EMA 9/21 crossover on M5
-      |         +-- Layer 2: ORB session range breakout
+      |         +-- [PRE-BLOCK] H1 trend filter (new v1.6)
+      |         +-- [PRE-BLOCK] ORB direction lock (new v1.6)
+      |         +-- Layer 1: EMA 9/21 crossover on M15
+      |         +-- Layer 2: ORB session range breakout (time-decayed)
       |         +-- Layer 3: CPR daily pivot bias
       |
       +---> risk checks (caps, cooldown, spread, margin)
@@ -53,380 +58,279 @@ bot.py  run_bot_cycle()
 
 | Data | Source | Granularity | Count | Cache |
 |---|---|---|---|---|
-| M5 candles (closes/highs/lows) | OANDA REST API | M5 | 40 candles | None (live each cycle) |
+| H1 candles (H1 trend filter) | OANDA REST API | H1 | 30 candles | None (live each cycle) |
+| M15 candles (EMA signal) | OANDA REST API | M15 | 40 candles | None (live each cycle) |
 | M15 candles (ORB detection) | OANDA REST API | M15 | 12 candles + timestamps | `orb_cache.json` per session/day |
-| Daily candles (CPR) | OANDA REST API | D | 3 candles | `cpr_cache.json` per SGT day |
+| Daily candles (CPR) | OANDA REST API | D | 3 candles | None (live each cycle) |
 
-### 3.2 Layer 1 — EMA 9/21 Crossover
+### 3.2 Pre-Score Hard Blocks (new v1.6)
+
+These run before any scoring. If either block fires, the signal returns score=0 immediately
+and no trade is placed. They are binary pass/fail gates — not scored.
+
+#### Block 1 — H1 Trend Filter
+
+Fetches H1 EMA9 and EMA21 before evaluating any M15 signal. If the M15 signal direction
+disagrees with the H1 trend, the signal is blocked entirely.
+
+```
+H1 EMA9 > EMA21 (bullish)  →  only BUY signals pass
+H1 EMA9 < EMA21 (bearish)  →  only SELL signals pass
+H1 EMAs flat   (neutral)   →  both directions allowed
+```
+
+This is the primary fix for consecutive SL hits on trending days, where M15 EMA repeatedly
+crosses against the macro H1 direction before the move exhausts.
+
+**Log signature:** `Signal H1 BLOCKED | dir=BUY but H1 BEARISH`
+**Disable:** set `h1_trend_filter_enabled: false` in settings.json
+
+#### Block 2 — ORB Direction Lock
+
+After the ORB is formed, if price has confirmed a session direction, trades in the opposite
+direction are blocked.
+
+```
+Price > ORB high  →  SELL signals blocked (session is bullish)
+Price < ORB low   →  BUY signals blocked  (session is bearish)
+Price inside ORB  →  both directions allowed
+```
+
+**Log signature:** `Signal ORB LOCKED | dir=BUY but price below ORB low`
+**Disable:** set `orb_direction_lock: false` in settings.json
+
+### 3.3 Layer 1 — EMA 9/21 Crossover
 
 **Implementation:**
-- EMA series computed on completed M5 candles only (live candle excluded)
-- Uses exponential smoothing formula: `EMA = price × k + prev_EMA × (1 − k)` where `k = 2 / (period + 1)`
-- `ema_fast_series` = EMA9 on `m5_closes[:-1]`
-- `ema_slow_series` = EMA21 on `m5_closes[:-1]`
+- EMA series computed on completed M15 candles only (live candle excluded)
+- Uses exponential smoothing: `EMA = price × k + prev_EMA × (1 − k)` where `k = 2 / (period + 1)`
 - Fresh cross detected by comparing `[-1]` and `[-2]` values of both series
 
 **Scoring logic:**
 
-```python
-fresh_bull = (ema_fast_now > ema_slow_now) and (ema_fast_prev <= ema_slow_prev)
-fresh_bear = (ema_fast_now < ema_slow_now) and (ema_fast_prev >= ema_slow_prev)
-```
-
 | Condition | Direction | Score |
 |---|---|---|
-| Fresh bull cross | BUY | +3 |
-| Fresh bear cross | SELL | +3 |
-| EMA9 > EMA21 (aligned, no cross) | BUY | +1 |
-| EMA9 < EMA21 (aligned, no cross) | SELL | +1 |
+| Fresh bull cross (EMA9 just crossed above EMA21) | BUY | +3 |
+| Fresh bear cross (EMA9 just crossed below EMA21) | SELL | +3 |
+| EMA9 > EMA21 (aligned, no fresh cross) | BUY | +1 |
+| EMA9 < EMA21 (aligned, no fresh cross) | SELL | +1 |
 | EMA9 == EMA21 | NONE | 0 — exit |
 
-**Why EMA over SMA:** EMA reacts faster to recent price action, making it
-better suited for 5-minute scalping on a volatile asset like gold.
+**Why M15 over M5:** M5 generated 8–14 EMA crosses per session on gold, mostly wick noise.
+M15 requires 15 minutes of sustained directional pressure to form a cross.
 
-### 3.3 Layer 2 — Opening Range Breakout (ORB)
+### 3.4 Layer 2 — Opening Range Breakout (ORB)
 
-**ORB definition:**
-The ORB is the high and low of the first completed M15 candle at or after the session open.
+**ORB definition:** High and low of the first completed M15 candle at or after session open.
 
-| Session | Open (SGT) | Open (GMT) | ORB candle |
-|---|---|---|---|
-| London | 16:00 | 08:00 | First completed M15 candle ≥ 16:00 SGT |
-| US | 21:00 | 13:00 | First completed M15 candle ≥ 21:00 SGT |
+| Session | Open (SGT) | Open (GMT) |
+|---|---|---|
+| London | 16:00 | 08:00 |
+| US | 21:00 | 13:00 |
 
 **Cache:** `data/orb_cache.json` — key format: `YYYY-MM-DD_London` / `YYYY-MM-DD_US`
 
-**ORB detection flow:**
-1. Check `orb_cache.json` — return cached values if `formed: true`
-2. If not cached: check `minutes_since_open >= 15` (M15 candle needs time to complete)
-3. Fetch last 12 M15 candles with timestamps
-4. Iterate candles — find first with `candle_time >= session_open_utc`
-5. Record that candle's high/low as ORB, save to cache
+**Scoring (time-decayed):**
 
-**Scoring logic:**
+| Age of ORB break | Score |
+|---|---|
+| 0 – 60 min (fresh) | +2 |
+| 60 – 120 min (aging) | +1 |
+| 120+ min (stale) | +0 |
+| Price inside ORB / ORB not formed | +0 |
 
-```python
-if direction == "BUY"  and current_close > orb_high:  score += 2
-if direction == "SELL" and current_close < orb_low:   score += 2
-```
+### 3.5 Layer 3 — CPR Pivot Bias
 
-If ORB has not formed yet: scores 0, no block.
+Calculated from previous day OANDA candle: `Pivot = (PDH + PDL + PDC) / 3`
 
-### 3.4 Layer 3 — CPR Pivot Bias
+Only the pivot is used for scoring. Price above pivot on BUY = +1. Price below pivot on SELL = +1.
 
-**CPR levels** (calculated from previous day OANDA candle):
+### 3.6 Exhaustion Penalty
 
-```
-Pivot = (PDH + PDL + PDC) / 3
-BC    = (PDH + PDL) / 2
-TC    = (Pivot - BC) + Pivot
-R1    = (2 × Pivot) − PDL
-S1    = (2 × Pivot) − PDH
-```
+If price is stretched more than `exhaustion_atr_mult` (default 3.0) ATR from the EMA midpoint,
+score is reduced by 1. Does not apply when an ORB breakout contributed to the score.
 
-**Only the pivot is used for scoring in RF Scalp v1.3.**
-TC, BC, R1, S1, R2, S2 are calculated and cached but not used for signal decisions.
-
-**Scoring logic:**
-
-```python
-if direction == "BUY"  and current_close > pivot:  score += 1
-if direction == "SELL" and current_close < pivot:  score += 1
-```
-
-**Cache:** `data/cpr_cache.json` — validated on load, re-fetched if stale or invalid.
-
-### 3.5 Exhaustion Penalty
-
-Prevents chasing overextended moves on fast M5 timeframes.
-
-```python
-ema_mid  = (ema_fast_now + ema_slow_now) / 2
-stretch  = abs(current_close - ema_mid) / atr_val
-if stretch > exhaustion_atr_mult (default 2.0):
-    score = max(score - 1, 0)
-```
-
-Set `exhaustion_atr_mult: 0` in settings to disable.
-
-### 3.6 Score-to-Decision Flow
+### 3.7 Score-to-Decision Flow
 
 ```
-score >= 5  →  $100 full position
-score >= 3  →  $66  partial position
-score < 4   →  No trade (below threshold)
+Pre-score blocks (v1.6):
+  H1 trend disagrees with direction   →  BLOCKED (score=0)
+  ORB direction lock triggered        →  BLOCKED (score=0)
 
-Mandatory blockers applied after scoring:
-  R:R < 2.0             →  BLOCKED
-  Spread > session limit →  BLOCKED
-  News within ±30 min   →  BLOCKED
-  Daily cap reached     →  BLOCKED
-  Session cap reached   →  BLOCKED
-  Active cooldown       →  BLOCKED
-  Friday cutoff         →  BLOCKED
+Scoring (max 6):
+  score >= 5  →  $100 full position
+  score >= 3  →  $66  partial position
+  score < 4   →  No trade
+
+Post-score blockers:
+  R:R < 2.0, spread exceeded, news block, daily/session cap,
+  cooldown active, direction block active, Friday cutoff
 ```
 
 ---
 
 ## 4. SL / TP Logic
 
-### 4.1 Stop Loss
-
-Default mode: `pct_based`
+Default mode: `pct_based` SL + `rr_multiple` TP
 
 ```
-SL_USD = entry_price × sl_pct
-       = entry_price × 0.0015    (0.15%)
+SL = entry × 0.0025  (0.25%)
+TP = SL × 2.5
 ```
 
-At gold $2,400: SL ≈ $3.60
-
-Fallback priority:
-1. `pct_based` (default) — uses `sl_pct` from settings
-2. `fixed_usd` — uses `fixed_sl_usd` (default $5.00)
-3. `atr_based` — `ATR(14) × atr_sl_multiplier (0.3)`, clamped $2–$8
-
-### 4.2 Take Profit
-
-Default mode: `rr_multiple`
-
-```
-TP_USD = SL_USD × rr_ratio
-       = SL_USD × 2.5
-```
-
-At gold $2,400: TP ≈ $9.00 (0.375% of entry)
-
-Mandatory guard: `TP_USD / SL_USD >= 2.0` — trade is blocked if not met.
-
-### 4.3 Comparison to RF v2.4
-
-| Parameter | RF v2.4 | RF Scalp v1.3 | Ratio |
-|---|---|---|---|
-| SL % | 0.25% | 0.15% | 0.6× tighter |
-| TP % | 0.75% | ~0.375% | 0.5× tighter |
-| RR | 3.0 | 2.5 | Slightly lower |
-| Trade duration | Minutes to hours | Seconds to minutes | Faster exits |
+At gold $3,300: SL ≈ $8.25, TP ≈ $20.63. Clamped: SL min $2, max $15.
 
 ---
 
 ## 5. Session & Risk Controls
 
-### 5.1 Session Windows
+### Session Windows
 
-| Window | SGT | GMT | Threshold | Cap |
-|---|---|---|---|---|
-| London | 16:00 – 20:59 | 08:00 – 13:00 | Score ≥ 3 | 4 trades |
-| US | 21:00 – 00:59 | 13:00 – 17:00 EDT | Score ≥ 3 | 4 trades |
-| Dead Zone | 01:00 – 15:59 | — | N/A | 0 |
+| Window | SGT | Threshold | Cap |
+|---|---|---|---|
+| London | 16:00 – 20:59 | Score ≥ 5 | 4 trades |
+| US | 21:00 – 00:59 | Score ≥ 4 | 10 trades |
+| Dead Zone | 01:00 – 15:59 | N/A | 0 |
 
-Session thresholds are configurable independently via `session_thresholds` in settings.
+### Daily Limits
 
-### 5.2 Daily Limits
+| Limit | Value |
+|---|---|
+| Max trades/day | 10 |
+| Max losses/day | 5 |
+| Max losses/session | 2 |
+| Loss cooldown | 30 min |
+| Consecutive SL direction block | 90 min (after 2 SLs in same direction) |
+| Friday cutoff | 23:00 SGT |
 
-| Limit | Value | Behaviour |
-|---|---|---|
-| Max trades/day | 8 | No new trades after 8 filled |
-| Max losses/day | 3 | No new trades after 3 losses |
-| Max losses/session | 2 | No new trades in current session |
-| Loss cooldown | 30 min | Pause after consecutive loss streak |
-| Friday cutoff | 23:00 SGT | No new entries on Friday night |
+### Spread Control
 
-### 5.3 Spread Control
+London and US: 130 pip limit. Global hard cap: 150 pips.
 
-| Session | Spread Limit (pips) | Behaviour |
-|---|---|---|
-| London | 130 | Skip cycle, send Telegram alert |
-| US | 130 | Skip cycle, send Telegram alert |
-| Global max | 150 | Hard fallback ceiling |
+### News Filter
 
-### 5.4 News Filter
-
-- Blocks ±30 minutes around **high-impact** news events
-- Medium-impact events apply a score penalty of −1
-- Calendar sourced from TradingEconomics API (`TRADINGECONOMICS_API_KEY`)
-- Refreshed every 60 minutes, retry after 15 minutes on failure
-- Lookahead window: 120 minutes ahead
+Blocks ±30 minutes around high-impact events. Medium-impact events apply −1 score penalty.
+Calendar from TradingEconomics API, refreshed every 60 minutes.
 
 ---
 
 ## 6. Order Execution
 
-All order execution is handled by `oanda_trader.py` (unchanged from RF v2.4).
-
-- Instrument: `XAU_USD`
-- Order type: Market order with attached SL and TP
-- Units calculated from: `position_usd / sl_usd` (risk-per-unit sizing)
-- Margin safety: `margin_safety_factor = 0.6` (never risk more than 60% of free margin)
-- Auto-scale on margin reject: reduces position size and retries
+- Instrument: `XAU_USD`, market order with attached SL and TP
+- Units: `position_usd / sl_usd` (risk-per-unit sizing)
+- Margin safety: `margin_safety_factor = 0.6`
+- Auto-scale on margin reject
 
 ---
 
 ## 7. Database & State Files
 
-### SQLite Database (`data/rf_scalp.db`)
-- Signals table: every cycle's score, direction, details, levels
-- Trades table: all filled orders with entry, SL, TP, outcome
-- Purge policy: 90-day rolling window, vacuum every Sunday
-
-### JSON State Files
-
 | File | Purpose |
 |---|---|
-| `data/cpr_cache.json` | Daily CPR levels, refreshed each SGT day |
-| `data/orb_cache.json` | ORB high/low per session per SGT day (new in v1.0) |
-| `data/signal_cache.json` | Dedup: prevents duplicate Telegram signal alerts |
-| `data/ops_state.json` | Session state, cooldown, caps — persists across cycles |
-| `data/runtime_state.json` | Cycle health — last started, last status, OANDA failures |
+| `data/rf_scalp.db` | SQLite — signals + trades, 90-day rolling window |
+| `data/orb_cache.json` | ORB high/low per session per SGT day |
+| `data/signal_cache.json` | Telegram dedup cache |
+| `data/ops_state.json` | Session state, cooldown flags, daily caps |
+| `data/runtime_state.json` | Cycle health — last started, OANDA failure count |
 | `data/trade_history.json` | Rolling 90-day trade log |
 
 ---
 
 ## 8. Telegram Reporting
 
-### 8.1 Real-time Alerts
+### Real-time Alerts
 
 | Message | When |
 |---|---|
 | Startup | Bot process starts |
-| Session Open | London (16:00 SGT) / US (21:00 SGT) each day |
-| Scalp Signal Update | Each 5-min cycle with active session |
-| Trade Opened | New order filled |
-| Trade Closed | TP or SL hit |
-| News Block | High-impact event pausing trades |
-| News Penalty | Medium-impact event reducing score |
+| Session Open | London / US each day |
+| Scalp Signal Update | Each 15-min cycle |
+| H1 Block | H1 trend mismatch blocked signal (new v1.6) |
+| ORB Lock | ORB direction conflict blocked signal (new v1.6) |
+| Trade Opened / Closed | On fill / TP or SL hit |
+| News Block / Penalty | Calendar event |
 | Spread Skip | Spread above limit |
-| Daily Cap | Max daily trades or losses hit |
-| Session Cap | Max per-session trades or losses hit |
-| Cooldown | Loss streak cooldown activated |
-| Friday Cutoff | No new trades alert |
-| Margin Adjusted | Position scaled down due to margin |
+| Daily / Session Cap | Limit hit |
+| Cooldown / Direction Block | Risk protection activated |
+| Friday Cutoff | No new trades |
+| Margin Adjusted | Position scaled down |
 
-### 8.2 Scheduled Reports
+### Scheduled Reports
 
-| Report | Schedule (SGT) |
-|---|---|
-| Daily Report | Mon–Fri 15:30 (30 min before London open) |
-| Weekly Report | Every Monday 08:15 |
-| Monthly Report | First Monday of month 08:00 |
+Daily: Mon–Fri 15:30 SGT · Weekly: Mon 08:15 · Monthly: First Mon 08:00
 
 ---
 
 ## 9. Railway Deployment
 
-### 9.1 Setup Steps
-
 ```
-1. Create new GitHub repo, push RF Scalp v1.3 folder contents
+1. Push RF Scalp v1.6 folder to GitHub repo
 2. Railway → New Project → Deploy from GitHub Repo
-3. Select repo → Railway auto-detects Procfile
-4. Add environment variables (Railway → Variables tab)
-5. Deploy triggers automatically on push to main branch
+3. Add env vars (Variables tab)
+4. Auto-deploys on push to main
 ```
 
-### 9.2 Environment Variables
+**Required env vars:** `OANDA_API_KEY`, `OANDA_ACCOUNT_ID`, `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_CHAT_ID`, `TRADINGECONOMICS_API_KEY`
 
-```
-OANDA_API_KEY              = <your OANDA API key>
-OANDA_ACCOUNT_ID           = <your OANDA account ID>
-TELEGRAM_BOT_TOKEN         = <your Telegram bot token>
-TELEGRAM_CHAT_ID           = <your Telegram chat ID>
-TRADINGECONOMICS_API_KEY   = <TradingEconomics API key>
-PORT                       = 8080  (optional, Railway sets this)
-```
-
-### 9.3 Health Monitoring
-
-```
-GET /health   →  {"status": "ok", "scheduler_running": true, ...}
-GET /metrics  →  Prometheus-style plain text counters
-```
-
-Set Railway's health check URL to `/health` for automatic restart on failure.
-
-### 9.4 Procfile
-
-```
-web: python scheduler.py
-```
+Health check: `GET /health` → `{"status": "ok", "scheduler_running": true, ...}`
 
 ---
 
 ## 10. Going Live Checklist
 
-Before switching `demo_mode` to `false`:
-
-- [ ] Run minimum 2 weeks in demo mode
-- [ ] Review weekly reports — win rate > 40%, average R:R > 1.8
-- [ ] Confirm OANDA live credentials differ from practice credentials
-- [ ] Update `OANDA_API_KEY` and `OANDA_ACCOUNT_ID` in Railway Variables
-- [ ] Set `demo_mode: false` in `settings.json` and redeploy
-- [ ] Monitor first 3 live trades manually via Telegram
-- [ ] Confirm SL/TP prices match expectations at session open
+- [ ] 2+ weeks demo mode with acceptable win rate (> 40%) and R:R (> 1.8)
+- [ ] Confirm H1 block logging correctly (`H1 BLOCKED` in Railway logs)
+- [ ] Confirm ORB lock logging correctly (`ORB LOCKED` in Railway logs)
+- [ ] Update OANDA live credentials in Railway Variables
+- [ ] Set `demo_mode: false` in settings.json and redeploy
+- [ ] Monitor first 3 live trades via Telegram
 
 ---
 
 ## 11. Differences from RF v2.4
 
-| Component | RF v2.4 | RF Scalp v1.3 |
+| Component | RF v2.4 | RF Scalp v1.6 |
 |---|---|---|
-| `signals.py` | CPR breakout engine | EMA + ORB + CPR bias scalp engine |
-| Signal timeframe | M15 | M5 |
-| Primary signal | Price breaks CPR/PDH/R1 | EMA9 crosses EMA21 |
-| Secondary signal | SMA20/SMA50 alignment | ORB session breakout |
-| Tertiary filter | CPR width (narrow = better) | CPR pivot bias (above/below) |
-| SMA usage | SMA20 + SMA50 for trend | Not used |
-| ORB logic | Not present | New — `_get_orb()` in signals.py |
-| `orb_cache.json` | Not present | New state file |
-| `sl_pct` | 0.0025 (0.25%) | 0.0015 (0.15%) |
-| `tp_pct` | 0.0075 (0.75%) | 0.0035 (0.35%) |
-| `rr_ratio` | 3.0 | 2.5 |
-| `sl_max_usd` | 20.0 | 8.0 |
-| `sl_min_usd` | 4.0 | 2.0 |
-| `atr_sl_multiplier` | 0.5 | 0.3 |
-| `version.py` | CPR Gold Bot v2.4 | RF Scalp v1.3 |
-| `bot.py` docstring | CPR references | Scalp references |
-| `telegram_templates.py` | CPR Signal Update | Scalp Signal Update |
-| Session windows | Identical | Identical |
-| Risk limits | Identical | Identical |
-| Infrastructure | — | Identical (no changes) |
+| Signal engine | CPR breakout | H1 filter + ORB lock + EMA M15 + ORB + CPR |
+| Signal timeframe | M15 | M15 |
+| H1 trend filter | None | Hard block (new v1.6) |
+| ORB direction guard | None | Hard block (new v1.6) |
+| Primary signal | CPR/PDH/R1 breakout | EMA9 crosses EMA21 |
+| Secondary | SMA20/SMA50 | ORB time-decayed breakout |
+| Tertiary | CPR width | CPR pivot bias |
+| `cycle_minutes` | — | 15 |
+| `max_trades_day` | — | 10 |
+| `max_trades_london` | — | 4 |
+| `consecutive_sl_block_minutes` | — | 90 |
+| `h1_trend_filter_enabled` | — | true (new) |
+| `orb_direction_lock` | — | true (new) |
+| `version.py` | CPR Gold Bot v2.4 | RF Scalp v1.6 |
 
 ---
 
 ## 12. Troubleshooting
 
-### Bot not trading during session hours
+**Bot not trading during session hours:**
+Check `data/ops_state.json` for `daily_cap_reached`. Check Railway logs for `H1 BLOCKED`
+or `ORB LOCKED` — these are expected on trending sessions and mean the filter is working.
 
-1. Check `data/ops_state.json` — look for `outside_session` or `daily_cap_reached`
-2. Check Railway logs for `SKIPPED` cycle status
-3. Confirm SGT time is correct in Railway region settings
+**H1 block firing every cycle:**
+The H1 trend is clearly established. This is correct. Wait for H1 EMA9/21 to flip. Do not
+disable the filter — this is it working as designed.
 
-### ORB not forming
+**ORB not forming:**
+ORB requires 15+ minutes after session open. Check `data/orb_cache.json` for today's entry.
 
-1. Check `data/orb_cache.json` — confirm entry exists for today's session
-2. ORB requires 15+ minutes after session open before it can be detected
-3. If OANDA M15 candle data is missing, ORB will score 0 (not block trade)
+**Low signal score every cycle:**
+Check for H1/ORB blocks first. Then: EMA may be flat (M15 needs sustained pressure), ORB
+may not have formed, CPR may be against direction, or exhaustion penalty may be reducing score.
 
-### Low signal score (score < 4 every cycle)
-
-1. EMA9 and EMA21 may be flat/converging — wait for clear trend on M5
-2. ORB may not have formed yet (first 15 min of session)
-3. CPR bias may be against direction — check CPR pivot vs current price
-4. Check `exhaustion_atr_mult` — may be reducing score if market is extended
-
-### CPR cache invalid warning in logs
-
-The bot will automatically re-fetch CPR levels from OANDA and rebuild the cache.
-This is a self-healing condition, no action required.
-
-### R:R below 2.0 blocking trades
-
-This can happen if `sl_pct` and `tp_pct` values produce an R:R < 2.0 at current price.
-Verify: `tp_pct / sl_pct >= 2.0` must be true.
-Default values (0.0035 / 0.0015 = 2.33) satisfy this condition.
+**R:R below 2.0 blocking trades:**
+Ensure `tp_mode` is set to `rr_multiple` (default). With `rr_ratio: 2.5` this always passes.
 
 ---
 
-*RF Scalp v1.3 — Technical Specification*
-*Forked from RF v2.4 · EMA 9/21 + ORB + CPR bias scalping engine*
+*RF Scalp v1.6 — Technical Specification*
+*Forked from RF v2.4 · H1 trend filter + ORB lock + EMA 9/21 M15 + ORB + CPR*
 *Deployed on Railway · OANDA · Telegram*

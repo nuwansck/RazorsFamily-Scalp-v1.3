@@ -1,28 +1,54 @@
-"""Signal engine for EMA crossover + ORB scalping on XAU/USD — RF Scalp v1.2.6
+"""Signal engine for EMA crossover + ORB scalping on XAU/USD — RF Scalp v1.6.0
+
+Timeframe stack:
+  H1  — Trend filter (hard block — only trade WITH H1 EMA9/21 direction)
+  M15 — EMA signal (entry trigger — upgraded from M5 to reduce noise)
 
 Strategy: EMA crossover + Opening Range Breakout (ORB) + CPR Bias
 
+v1.6.0 changes vs v1.5:
+  - H1 trend filter: hard block — if M15 direction disagrees with H1 EMA9/21,
+    the signal is blocked entirely. No counter-trend trades.
+    H1 EMA9 > EMA21 (bullish) → only BUY signals pass
+    H1 EMA9 < EMA21 (bearish) → only SELL signals pass
+    H1 EMAs flat   (neutral)  → both directions allowed
+    Disable via h1_trend_filter_enabled: false in settings.json
+  - ORB direction lock: if ORB formed and price confirmed a side (e.g. below
+    ORB low), block trades in the opposite direction entirely.
+    Disable via orb_direction_lock: false in settings.json
+  - Signal candle: M5 → M15 (cuts noise signals by ~60%; same logic, M15 data)
+  - cycle_minutes: 5 → 15 (aligns cycle to M15 candle close)
+  - Daily/session caps tightened (max_trades_day 20→10, london cap 10→4)
+  - consecutive_sl_block_minutes: 60 → 90 (matches Aurum; avoids re-entry into
+    same trending move before it exhausts)
+
 Scoring (Bull — BUY):
-  EMA cross     — fresh EMA9 crosses above EMA21 (last 2 candles): +3
-                  EMA9 already above EMA21 (aligned, no fresh cross): +1
+  EMA cross     — fresh EMA9 crosses above EMA21 (last 2 M15 candles): +3
+                  EMA9 already above EMA21 (aligned, no fresh cross):   +1
   ORB           — price above ORB high, time-weighted:
-                    0–orb_fresh_minutes:  +2 (fresh break)
+                    0–orb_fresh_minutes:              +2 (fresh break)
                     orb_fresh_minutes–orb_aging_minutes: +1 (aging)
-                    orb_aging_minutes+:   +0 (stale, expired)
+                    orb_aging_minutes+:               +0 (stale, expired)
   CPR bias      — price above CPR pivot: +1
 
 Scoring (Bear — SELL):
-  EMA cross     — fresh EMA9 crosses below EMA21 (last 2 candles): +3
-                  EMA9 already below EMA21 (aligned, no fresh cross): +1
+  EMA cross     — fresh EMA9 crosses below EMA21 (last 2 M15 candles): +3
+                  EMA9 already below EMA21 (aligned, no fresh cross):   +1
   ORB           — price below ORB low, same time-weighted decay
   CPR bias      — price below CPR pivot: +1
 
 Max score: 6  |  Min threshold: signal_threshold (default 4)
 
+Pre-score hard blocks (do not affect score — either pass or kill the signal):
+  H1 trend filter  — direction vs H1 EMA9/21 (new v1.6.0)
+  ORB direction lock — direction vs confirmed ORB side (new v1.6.0)
+
 All scoring parameters are read from settings.json — no hardcoded values.
 Key settings: ema_fast_period, ema_slow_period, orb_fresh_minutes,
 orb_aging_minutes, orb_formation_minutes, min_rr_ratio, sl_pct, tp_pct,
-rr_ratio, tp_mode, exhaustion_atr_mult, signal_threshold.
+rr_ratio, tp_mode, exhaustion_atr_mult, signal_threshold,
+h1_trend_filter_enabled, h1_ema_fast_period, h1_ema_slow_period,
+h1_candle_count, orb_direction_lock.
 
 ORB definition:
   London session ORB — first completed M15 candle from 16:00 SGT (08:00 GMT)
@@ -134,14 +160,51 @@ class SignalEngine:
         if levels is None:
             return 0, "NONE", "Could not fetch CPR levels", {}, 0
 
-        # -- 2. M5 candles for EMA + price ------------------------------------
+        # -- 2. H1 trend filter — fetch before scoring ------------------------
+        # Hard block: if H1 EMA direction disagrees with the M5 signal,
+        # the trade is blocked entirely. No counter-trend trades.
+        # H1 EMA9 > EMA21 (bullish)  → only BUY signals pass
+        # H1 EMA9 < EMA21 (bearish)  → only SELL signals pass
+        # H1 EMAs flat   (neutral)   → both directions allowed
+        # Disable via h1_trend_filter_enabled: false in settings.json
+        _h1_enabled  = bool((settings or {}).get("h1_trend_filter_enabled", True))
+        _h1_ema_fast = int((settings or {}).get("h1_ema_fast_period", 9))
+        _h1_ema_slow = int((settings or {}).get("h1_ema_slow_period", 21))
+        _h1_count    = int((settings or {}).get("h1_candle_count",    30))
+
+        h1_trend    = "NEUTRAL"   # BULLISH | BEARISH | NEUTRAL
+        h1_ema_fast = None
+        h1_ema_slow = None
+
+        if _h1_enabled:
+            h1_closes, _, _ = self._fetch_candles(instrument, "H1", _h1_count)
+            if len(h1_closes) >= _h1_ema_slow + 2:
+                h1_fast_series = self._ema_series(h1_closes[:-1], _h1_ema_fast)
+                h1_slow_series = self._ema_series(h1_closes[:-1], _h1_ema_slow)
+                if h1_fast_series and h1_slow_series:
+                    h1_ema_fast = round(h1_fast_series[-1], 2)
+                    h1_ema_slow = round(h1_slow_series[-1], 2)
+                    if h1_ema_fast > h1_ema_slow:
+                        h1_trend = "BULLISH"
+                    elif h1_ema_fast < h1_ema_slow:
+                        h1_trend = "BEARISH"
+            else:
+                log.warning("Not enough H1 candles for trend filter — treating as NEUTRAL")
+
+        levels["h1_trend"]    = h1_trend
+        levels["h1_ema_fast"] = h1_ema_fast
+        levels["h1_ema_slow"] = h1_ema_slow
+
+        # -- 3. M5 candles for EMA + price ------------------------------------
         # Read EMA periods from settings (falls back to module-level defaults)
         _ema_fast      = int((settings or {}).get("ema_fast_period",  EMA_FAST))
         _ema_slow      = int((settings or {}).get("ema_slow_period",  EMA_SLOW))
         _atr_period    = int((settings or {}).get("atr_period",       14))
         _m5_count      = int((settings or {}).get("m5_candle_count",  40))
 
-        m5_closes, m5_highs, m5_lows = self._fetch_candles(instrument, "M5", _m5_count)
+        m15_closes, m15_highs, m15_lows = self._fetch_candles(instrument, "M15", _m5_count)
+        # Alias so remainder of signal logic is unchanged
+        m5_closes, m5_highs, m5_lows = m15_closes, m15_highs, m15_lows
         if len(m5_closes) < _ema_slow + 3:
             return 0, "NONE", "Not enough M5 data (need {} candles)".format(_ema_slow + 3), levels, 0
 
@@ -235,6 +298,55 @@ class SignalEngine:
         else:
             reasons.append("No EMA bias (+0)")
             return 0, "NONE", " | ".join(reasons), levels, 0
+
+        # 5b-pre. H1 trend hard block (Fix #1 — v1.6.0) -----------------------
+        # If H1 EMA direction is clear and opposes the M15 signal, block it
+        # entirely. Primary cause of consecutive SL hits on trending days.
+        if _h1_enabled and h1_trend != "NEUTRAL":
+            if direction == "BUY" and h1_trend == "BEARISH":
+                block_reason = (
+                    "H1 TREND BLOCK — H1 EMA bearish ({:.2f}<{:.2f}), "
+                    "no BUY until H1 turns bullish".format(
+                        h1_ema_fast or 0, h1_ema_slow or 0))
+                reasons.append(block_reason)
+                levels["h1_blocked"] = True
+                log.info("Signal H1 BLOCKED | dir=BUY but H1 BEARISH | %s", block_reason)
+                return 0, "NONE", " | ".join(reasons), levels, 0
+            if direction == "SELL" and h1_trend == "BULLISH":
+                block_reason = (
+                    "H1 TREND BLOCK — H1 EMA bullish ({:.2f}>{:.2f}), "
+                    "no SELL until H1 turns bearish".format(
+                        h1_ema_fast or 0, h1_ema_slow or 0))
+                reasons.append(block_reason)
+                levels["h1_blocked"] = True
+                log.info("Signal H1 BLOCKED | dir=SELL but H1 BULLISH | %s", block_reason)
+                return 0, "NONE", " | ".join(reasons), levels, 0
+            reasons.append("H1 {} confirms {} direction ✓".format(h1_trend, direction))
+            levels["h1_blocked"] = False
+        else:
+            levels["h1_blocked"] = False
+            if not _h1_enabled:
+                reasons.append("H1 filter disabled")
+            else:
+                reasons.append("H1 NEUTRAL — both directions allowed")
+
+        # 5b-pre2. ORB direction lock (Fix #2 — v1.6.0) -----------------------
+        # If ORB is formed and price confirmed a session direction, block trades
+        # going against that structure.
+        _orb_lock = bool((settings or {}).get("orb_direction_lock", True))
+        if _orb_lock and orb_formed and orb_high and orb_low:
+            if direction == "BUY" and current_close < orb_low:
+                reasons.append(
+                    "ORB DIRECTION LOCK — price {:.2f} below ORB low {:.2f}, no BUY".format(
+                        current_close, orb_low))
+                log.info("Signal ORB LOCKED | dir=BUY but price below ORB low")
+                return 0, "NONE", " | ".join(reasons), levels, 0
+            if direction == "SELL" and current_close > orb_high:
+                reasons.append(
+                    "ORB DIRECTION LOCK — price {:.2f} above ORB high {:.2f}, no SELL".format(
+                        current_close, orb_high))
+                log.info("Signal ORB LOCKED | dir=SELL but price above ORB high")
+                return 0, "NONE", " | ".join(reasons), levels, 0
 
         # 5b. ORB confirmation (time-decayed) ----------------------------------
         # v1.2.6: ORB points decay based on how long ago the session opened.

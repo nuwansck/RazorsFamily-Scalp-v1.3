@@ -2,7 +2,152 @@
 
 ---
 
-## v1.4.0 — 2026-03-25
+## v1.6.0 — 2026-03-26
+
+### Win-rate accuracy overhaul — 5 targeted fixes
+
+Addresses the root causes of RF Scalp's documented poor win rates (London WR:
+38% → 25% → 0% across v1.4 sessions). Every change is derived from comparing
+live session data and porting the highest-impact protections from Aurum v1.0.
+
+---
+
+#### 🔴 Fix #1 — H1 trend hard block (`signals.py`, `settings.json`)
+
+**Problem:** On trending days M15 EMA keeps crossing against the macro
+direction. The bot sells into a rising H1 trend or buys into a falling one.
+This was identified in Aurum's changelog as *"the most common cause of
+consecutive SL hits"* — and RF Scalp had no equivalent protection.
+
+**Fix:** Before any scoring, fetch H1 EMA9/21. If the M15 signal direction
+disagrees with H1 trend, the signal is blocked entirely and returns score=0.
+
+```
+H1 EMA9 > EMA21 (bullish)  → only BUY signals pass
+H1 EMA9 < EMA21 (bearish)  → only SELL signals pass
+H1 EMAs flat   (neutral)   → both directions allowed
+```
+
+Disable via `h1_trend_filter_enabled: false` in settings.json.
+H1 trend shown in every Telegram signal alert.
+
+**New settings keys:**
+```json
+"h1_trend_filter_enabled": true,
+"h1_ema_fast_period": 9,
+"h1_ema_slow_period": 21,
+"h1_candle_count": 30
+```
+
+**Log signature:** `Signal H1 BLOCKED | dir=BUY but H1 BEARISH`
+
+---
+
+#### 🔴 Fix #2 — ORB direction lock (`signals.py`, `settings.json`)
+
+**Problem:** If the ORB has formed and price has confirmed a bearish session
+(price below ORB low), the bot can still take BUY trades on an M15 EMA cross.
+This is the same structural error as trading counter-trend — the session
+momentum has already shown its hand.
+
+**Fix:** After ORB formation, if price has confirmed a side, block trades in
+the opposite direction entirely.
+
+```
+Price > ORB high → SELL signals blocked
+Price < ORB low  → BUY signals blocked
+Price inside ORB → both directions allowed
+```
+
+Disable via `orb_direction_lock: false` in settings.json.
+
+**New settings key:**
+```json
+"orb_direction_lock": true
+```
+
+**Log signature:** `Signal ORB LOCKED | dir=BUY but price below ORB low`
+
+---
+
+#### 🟡 Fix #3 — Signal candle M5 → M15 (`signals.py`, `settings.json`)
+
+**Problem:** M5 generates 8–14 EMA crosses per session on gold, most of which
+are wick noise. A cross that closes in 5 minutes carries very little weight.
+
+**Fix:** Signal candle upgraded to M15. Same EMA logic, same scoring — only
+the data granularity changes. M15 requires 15 minutes of price pressure to
+form a cross, which aligns well with the ORB formation window (also M15).
+
+```
+m5_candle_count: 40  →  now fetches 40 × M15 candles (alias, no logic change)
+cycle_minutes:    5  →  15 (aligns polling to M15 candle close timing)
+```
+
+---
+
+#### 🟡 Fix #4 — Tighter session and daily trade caps (`settings.json`)
+
+**Problem:** With 20 trades/day and 10/session allowed, bad days compound
+losses heavily before the daily limit kicks in. London in particular has shown
+consistently low WR at high volume.
+
+**Fix:** Caps reduced to a midpoint between Aurum's conservative limits and
+RF Scalp v1.5's permissive ones.
+
+| Key | v1.5 | v1.6 |
+|---|---|---|
+| `max_trades_day` | 20 | **10** |
+| `max_losing_trades_day` | 8 | **5** |
+| `max_trades_london` | 10 | **4** |
+| `max_losing_trades_session` | 4 | **2** |
+
+US session cap unchanged at 10 — US consistently outperforms London.
+
+---
+
+#### 🟡 Fix #5 — Consecutive SL block widened 60 → 90 min (`settings.json`)
+
+**Problem:** The 60-minute direction block releases too early. A strong
+trending move on gold typically takes 60–90 minutes to exhaust. Releasing the
+block at 60 min often re-enters into the same move before it reverses.
+
+**Fix:** `consecutive_sl_block_minutes` raised to 90, matching Aurum v1.0.
+
+```json
+"consecutive_sl_block_minutes": 60  →  90
+```
+
+---
+
+### Settings changes summary
+
+| Key | v1.5 | v1.6 |
+|---|---|---|
+| `bot_name` | `RF Scalp v1.5` | `RF Scalp v1.6` |
+| `cycle_minutes` | 5 | **15** |
+| `max_trades_day` | 20 | **10** |
+| `max_losing_trades_day` | 8 | **5** |
+| `max_trades_london` | 10 | **4** |
+| `max_losing_trades_session` | 4 | **2** |
+| `consecutive_sl_block_minutes` | 60 | **90** |
+| `h1_trend_filter_enabled` | — | **true** (new) |
+| `h1_ema_fast_period` | — | **9** (new) |
+| `h1_ema_slow_period` | — | **21** (new) |
+| `h1_candle_count` | — | **30** (new) |
+| `orb_direction_lock` | — | **true** (new) |
+
+### All v1.5 features carry forward
+- ORB time-decay scoring (fresh/aging/stale windows)
+- Consecutive SL direction block
+- CPR bias filter
+- Exhaustion ATR penalty (with ORB-break exemption)
+- Full Telegram templates (TP1/TP2/TP3 display)
+- Daily report with trade-by-trade log
+
+---
+
+## v1.5.0 — 2026-03-26
 
 ### 🔴 New — Consecutive SL Direction Block (`bot.py`)
 

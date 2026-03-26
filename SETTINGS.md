@@ -13,7 +13,7 @@ in the code — everything is read from this file and has a safe fallback defaul
 
 | Key | Default | Description |
 |---|---|---|
-| `bot_name` | `"RF Scalp v1.2.6"` | Shown in Telegram alerts and logs. Change when deploying a new version. |
+| `bot_name` | `"RF Scalp v1.6"` | Shown in Telegram alerts and logs. Change when deploying a new version. |
 | `demo_mode` | `true` | `true` = OANDA demo account. Set to `false` for live trading. |
 | `trade_gold` | `true` | Master on/off switch for trading. Set to `false` to pause without stopping the bot. |
 | `enabled` | `true` | Secondary on/off switch. `false` = bot skips all trade cycles but stays running. Use `trade_gold` for normal pausing. |
@@ -22,21 +22,42 @@ in the code — everything is read from this file and has a safe fallback defaul
 
 ## Signal Engine
 
-These control how the bot scores each 5-minute candle and decides whether to trade.
+These control how the bot scores each 15-minute candle and decides whether to trade.
 
 | Key | Default | Description |
 |---|---|---|
 | `signal_threshold` | `4` | Minimum score (out of 6) required to place a trade. Raise to 5 for higher-quality signals only. |
-| `session_thresholds` | `{"London": 4, "US": 4}` | Per-session score threshold. Can differ — e.g. `{"London": 5, "US": 4}` to be stricter in London. |
-| `ema_fast_period` | `9` | Fast EMA period. Used for crossover detection. |
+| `session_thresholds` | `{"London": 5, "US": 4}` | Per-session score threshold. London is stricter (5) due to historically lower win rates. |
+| `ema_fast_period` | `9` | Fast EMA period. Used for crossover detection on M15 candles. |
 | `ema_slow_period` | `21` | Slow EMA period. EMA fast crossing above/below slow is the primary direction signal. |
-| `m5_candle_count` | `40` | Number of M5 candles fetched from OANDA per cycle. Must be > `ema_slow_period + 3`. |
+| `m5_candle_count` | `40` | Number of M15 candles fetched from OANDA per cycle (key name retained for compatibility). |
 
-### Scoring breakdown (max 6 points):
-- **EMA fresh cross** (9 just crossed 21 this candle): **+3 pts**
+### Scoring breakdown (max 6 points)
+- **EMA fresh cross** (9 just crossed 21 this M15 candle): **+3 pts**
 - **EMA trend only** (9 already above/below 21, no fresh cross): **+1 pt**
 - **ORB break** (price outside opening range, time-decayed): **+2 / +1 / +0 pts**
 - **CPR bias** (price on correct side of daily pivot): **+1 pt**
+
+### Pre-score hard blocks (new v1.6 — do not affect score, kill the signal entirely)
+
+**H1 trend filter** — fetched before any scoring:
+
+| Key | Default | Description |
+|---|---|---|
+| `h1_trend_filter_enabled` | `true` | Enable H1 EMA trend hard block. `false` = both directions always allowed. |
+| `h1_ema_fast_period` | `9` | Fast EMA period for the H1 trend filter. |
+| `h1_ema_slow_period` | `21` | Slow EMA period for the H1 trend filter. |
+| `h1_candle_count` | `30` | Number of H1 candles fetched to compute the H1 trend EMAs. |
+
+Logic: H1 EMA9 > EMA21 → only BUY signals pass. H1 EMA9 < EMA21 → only SELL signals pass. H1 flat → both allowed.
+
+**ORB direction lock** — applied after ORB is fetched:
+
+| Key | Default | Description |
+|---|---|---|
+| `orb_direction_lock` | `true` | Block trades against the confirmed ORB direction. `false` = disable. |
+
+Logic: if price < ORB low (session is bearish) → BUY signals blocked. If price > ORB high (session is bullish) → SELL signals blocked. If price inside ORB → both directions allowed.
 
 ---
 
@@ -68,7 +89,7 @@ Used for the exhaustion penalty — prevents trading when price is over-stretche
 
 | Key | Default | Description |
 |---|---|---|
-| `atr_period` | `14` | Lookback period for ATR calculation on M5 candles. Standard value — rarely needs changing. |
+| `atr_period` | `14` | Lookback period for ATR calculation on M15 candles. Standard value — rarely needs changing. |
 | `exhaustion_atr_mult` | `3.0` | If price is stretched more than this many ATR from the EMA midpoint, score is penalised by −1. Does not apply to ORB breakouts. |
 
 ---
@@ -123,7 +144,7 @@ Used for the exhaustion penalty — prevents trading when price is over-stretche
 | `session_only` | `true` | `true` = only trade during London and US windows. `false` = trade any time (not recommended). |
 | `trading_day_start_hour_sgt` | `8` | Hour (SGT) when daily counters reset (trade count, loss count). |
 | `friday_cutoff_hour_sgt` | `23` | Stop trading on Friday after this hour SGT. |
-| `cycle_minutes` | `5` | How often the bot runs its trade evaluation loop. Do not change unless testing. |
+| `cycle_minutes` | `15` | How often the bot runs its trade evaluation loop. Aligned to M15 candle close timing. |
 
 ---
 
