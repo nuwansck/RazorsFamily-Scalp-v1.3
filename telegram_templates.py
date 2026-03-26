@@ -53,35 +53,32 @@ def msg_signal_update(
     execution_checks: list[tuple[str, bool | None, str]] | None = None,
     cycle_minutes: int = 5,
 ) -> str:
-    news_line = f"📰 News penalty active ({news_penalty})\n" if news_penalty else ""
-    score_str = f"{score}/6"
+    """Simplified signal update — AtomicFX style (v1.5)."""
+    # Direction icon
+    dir_icon = "📈" if direction == "BUY" else ("📉" if direction == "SELL" else "•")
+    # Score bar
+    filled  = "█" * score + "░" * (6 - score)
+    score_str = f"{score}/6  [{filled}]"
     if raw_score is not None and news_penalty:
-        score_str += f"  (raw {raw_score}, news {news_penalty:+d})"
-    details = "\n".join(f"  {r}" for r in detail_lines[:4]) or "  No signal notes"
-    mandatory_text = _render_check_section("Mandatory checks", mandatory_checks)
-    quality_text   = _render_check_section("Quality checks",   quality_checks)
-    execution_text = _render_check_section("Execution checks", execution_checks)
+        score_str += f"  (raw {raw_score} | news {news_penalty:+d})"
+    # Session icon
+    sess_icon = "🇬🇧" if "London" in session else "🗽"
+    # Key detail line — first non-empty detail
+    key_detail = next((d for d in detail_lines if d.strip()), "—")
+    # News line
+    news_line = f"⚠️ News penalty: {news_penalty:+d}\n" if news_penalty else ""
+    # Decision icon
+    dec_icon = "🔍" if decision == "WATCHING" else "⏸️"
+
     return (
-        f"{banner} SESSION\n"
-        f"📊 Scalp Signal Update\n{_DIV}\n"
-        f"Window:    {session}\n"
-        f"Bias:      {direction}\n"
-        f"Score:     {score_str}\n"
-        f"Position:  {_position_label(position_usd)}\n"
-        f"Strategy:  EMA9/21 + ORB | CPR bias: {cpr_width_pct:.2f}%\n"
-        f"Decision:  {decision}\n"
-        f"Reason:    {reason}\n"
+        f"{sess_icon} {session.replace(' (London)', '').replace(' (US)', '')}  |  {dec_icon} Watching\n"
         f"{_DIV}\n"
-        f"{mandatory_text}"
-        f"{_DIV}\n"
-        f"{quality_text}"
-        f"{_DIV}\n"
-        f"{execution_text}"
-        f"{_DIV}\n"
-        f"Signal notes\n"
-        f"{details}\n"
-        f"{_DIV}\n"
+        f"Bias:    {dir_icon} {direction}\n"
+        f"Score:   {score_str}\n"
+        f"Setup:   {key_detail}\n"
+        f"CPR:     {cpr_width_pct:.2f}% width\n"
         f"{news_line}"
+        f"{_DIV}\n"
         f"Next cycle in {cycle_minutes} min"
     )
 
@@ -114,25 +111,60 @@ def msg_trade_opened(
     margin_mode: str = "NORMAL",
     margin_usage_pct: float | None = None,
 ) -> str:
+    """AtomicFX-style trade opened with TP1 (bot target) + TP2/TP3 (manual reference) (v1.5)."""
     slip     = fill_price - signal_price
-    slip_str = f"  (signal ${signal_price:.2f}, slip ${slip:+.2f})" if abs(slip) > 0.005 else ""
+    slip_str = f"  (slip {slip:+.2f})" if abs(slip) > 0.005 else ""
     score_str = f"{score}/6"
     if raw_score is not None and news_penalty:
-        score_str += f"  (raw {raw_score}, news {news_penalty:+d})"
+        score_str += f"  (raw {raw_score} | news {news_penalty:+d})"
     mode = "DEMO" if demo else "LIVE"
+
+    # Session icon
+    sess_icon = "🇬🇧" if "London" in session else "🗽"
+    # Direction
+    dir_icon  = "📈" if direction == "BUY" else "📉"
+    # Session label clean
+    sess_label = session.replace(" (London)", "").replace(" (US)", "")
+
+    # TP1 = bot target (rr_ratio × SL)
+    tp1_usd  = tp_usd
+    tp1_pts  = abs(tp_price - fill_price)
+    # TP2 = 3.0 × SL (manual reference)
+    tp2_mult = 3.0
+    tp2_usd  = round(sl_usd * tp2_mult, 2)
+    tp2_pts  = round(sl_usd / fill_price * fill_price * tp2_mult / fill_price * fill_price, 2) if fill_price > 0 else 0
+    # Simpler: TP2 price from SL distance
+    sl_dist  = abs(fill_price - sl_price)
+    tp2_price = (fill_price - sl_dist * tp2_mult) if direction == "SELL" else (fill_price + sl_dist * tp2_mult)
+    # TP3 = 4.0 × SL (manual reference)
+    tp3_mult  = 4.0
+    tp3_price = (fill_price - sl_dist * tp3_mult) if direction == "SELL" else (fill_price + sl_dist * tp3_mult)
+    tp3_usd   = round(sl_usd * tp3_mult, 2)
+
+    rr1 = round(rr_ratio, 1)
+    rr2 = tp2_mult
+    rr3 = tp3_mult
+
+    # Score bar
+    filled = "█" * score + "░" * (6 - score)
+
     return (
-        f"{banner} 🥇 New Trade — {direction}\n{_DIV}\n"
-        f"Setup:    {setup}\n"
-        f"Window:   {session}\n"
-        f"Fill:     ${fill_price:.2f}{slip_str}\n"
-        f"SL:       ${sl_price:.2f}  (-${sl_usd:.2f})\n"
-        f"TP:       ${tp_price:.2f}  (+${tp_usd:.2f})\n"
-        f"Units:    {units}\n"
-        f"Position: {_position_label(position_usd)}  (1:{rr_ratio:.0f})\n"
-        f"EMA:      CPR bias={cpr_width_pct:.2f}% | Spread: {spread_pips} pips\n"
-        f"Score:    {score_str}\n"
-        f"Balance:  ${balance:.2f}\n"
-        f"Mode:     {mode}"
+        f"📊 {direction} GOLD — {sess_label}\n"
+        f"{_DIV}\n"
+        f"◆ Entry:  ${fill_price:.2f}{slip_str}\n"
+        f"✅ TP1:   ${tp_price:.2f}  (+${tp1_usd:.2f} | {rr1:.1f}×RR)  ← bot target\n"
+        f"◻  TP2:   ${tp2_price:.2f}  (+${tp2_usd:.2f} | {rr2:.1f}×RR)  ← manual ref\n"
+        f"◻  TP3:   ${tp3_price:.2f}  (+${tp3_usd:.2f} | {rr3:.1f}×RR)  ← manual ref\n"
+        f"✗  SL:    ${sl_price:.2f}  (−${sl_usd:.2f})\n"
+        f"{_DIV}\n"
+        f"Setup:   {setup}\n"
+        f"Score:   {score_str}  [{filled}]\n"
+        f"Size:    {_position_label(position_usd)}  |  Units: {units}\n"
+        f"Spread:  {spread_pips} pips  |  CPR: {cpr_width_pct:.2f}%\n"
+        f"Balance: ${balance:.2f}  ({mode})\n"
+        f"{_DIV}\n"
+        f"TP2/TP3 are manual reference levels only.\n"
+        f"Bot targets TP1 automatically."
     )
 
 
@@ -174,22 +206,34 @@ def msg_trade_closed(
     session: str,
     demo: bool,
     duration_str: str = "",
+    trades_today: int = 0,
+    wins_today: int = 0,
+    losses_today: int = 0,
+    pnl_today: float | None = None,
 ) -> str:
-    outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN")
-    icon    = "✅" if pnl > 0 else ("❌" if pnl < 0 else "➡️")
-    duration_line = f"Duration:  {duration_str}\n" if duration_str else ""
-    mode    = "DEMO" if demo else "LIVE"
+    """AtomicFX-style trade closed — clean entry→close, pips, running today total (v1.5)."""
+    outcome   = "TP1" if pnl > 0 else ("SL" if pnl < 0 else "BE")
+    win_icon  = "✅ 👑" if pnl > 0 else ("❌" if pnl < 0 else "➡️")
+    move_pts  = abs(close_price - entry)
+    move_dir  = "+" if pnl > 0 else "-"
+    mode      = "DEMO" if demo else "LIVE"
+    dur_line  = f"  |  {duration_str}" if duration_str else ""
+
+    # Running today summary
+    today_line = ""
+    if trades_today > 0 and pnl_today is not None:
+        today_line = (
+            f"{_DIV}\n"
+            f"Today:  {trades_today} trade(s)  |  {wins_today}W / {losses_today}L  |  ${pnl_today:+.2f}"
+        )
+
     return (
-        f"{icon} Trade Closed — {outcome}\n{_DIV}\n"
-        f"Trade ID:  {trade_id}\n"
-        f"Direction: {direction}\n"
-        f"Setup:     {setup}\n"
-        f"Entry:     ${entry:.2f}\n"
-        f"Close:     ${close_price:.2f}\n"
-        f"PnL:       ${pnl:+.2f}\n"
-        f"{duration_line}"
-        f"Session:   {session}\n"
-        f"Mode:      {mode}"
+        f"📊 {direction} {outcome} {win_icon}\n"
+        f"{_DIV}\n"
+        f"Entry:  ${entry:.2f}  →  Close: ${close_price:.2f}\n"
+        f"Move:   {move_dir}{move_pts:.2f} pts{dur_line}\n"
+        f"PnL:    ${pnl:+.2f}\n"
+        f"{today_line}"
     )
 
 
@@ -530,39 +574,48 @@ def msg_daily_report(
     blocked_spread: int = 0,
     blocked_news: int = 0,
     blocked_signal: int = 0,
+    trade_list: list[dict] | None = None,
 ) -> str:
-    icon       = _pnl_icon(day_stats["net_pnl"]) if day_stats["count"] > 0 else "📋"
-    r_line     = f"  Avg R:    {day_stats['avg_r']}R\n" if day_stats.get("avg_r") is not None else ""
-    open_line  = f"Open now:  {open_count} position(s)\n" if open_count > 0 else ""
-    pf_val     = day_stats.get("profit_factor")
-    pf_line    = f"  P.Factor: {pf_val}\n" if pf_val is not None else ""
-    best       = day_stats.get("best_trade")
-    worst      = day_stats.get("worst_trade")
-    best_line  = f"  Best:     ${best['pnl']:+.2f}  ({best['time']} SGT)\n"  if best  else ""
-    worst_line = f"  Worst:    ${worst['pnl']:+.2f}  ({worst['time']} SGT)\n" if worst else ""
+    """AtomicFX-style daily report with numbered trade list (v1.5)."""
+    icon      = _pnl_icon(day_stats["net_pnl"]) if day_stats["count"] > 0 else "📋"
+    open_line = f"Open now:  {open_count} position(s)\n" if open_count > 0 else ""
 
-    # Blocked cycles breakdown
+    # ── Numbered trade list ──────────────────────────────────────────────────
+    trade_lines = ""
+    if trade_list:
+        for i, t in enumerate(trade_list, 1):
+            pnl   = t.get("pnl", 0)
+            dir_  = t.get("direction", "?")
+            type_ = "TP1" if pnl > 0 else "SL"
+            pts   = t.get("pts", "")
+            icon_ = "✅" if pnl > 0 else "❌"
+            be_   = " 🔵" if t.get("breakeven") else ""
+            pts_str = f"  {'+' if pnl>0 else ''}{pts} pts 👑" if pts and pnl > 0 else ""
+            trade_lines += f"{i}. {dir_} {type_} {icon_}{be_}{pts_str}\n"
+    elif day_stats["count"] == 0:
+        trade_lines = "No closed trades\n"
+    else:
+        # Fallback if trade_list not passed
+        trade_lines = f"{day_stats['count']} trades  {day_stats['wins']}W/{day_stats['losses']}L\n"
+
+    # ── Blocked cycles ───────────────────────────────────────────────────────
     blocked_parts = []
-    if blocked_spread:
-        blocked_parts.append(f"{blocked_spread} spread")
-    if blocked_news:
-        blocked_parts.append(f"{blocked_news} news")
-    if blocked_signal:
-        blocked_parts.append(f"{blocked_signal} signal-only")
+    if blocked_spread:  blocked_parts.append(f"{blocked_spread} spread")
+    if blocked_news:    blocked_parts.append(f"{blocked_news} news")
+    if blocked_signal:  blocked_parts.append(f"{blocked_signal} signal-only")
     blocked_line = f"Blocked:   {', '.join(blocked_parts)}\n" if blocked_parts else ""
 
-    prev_cap_line = "⚠️ Yesterday hit daily loss cap\n" if day_stats.get("ended_on_loss_cap") else ""
+    prev_cap_line = "⚠️ Hit daily loss cap yesterday\n" if day_stats.get("ended_on_loss_cap") else ""
 
     return (
         f"{icon} Daily Report — {day_label}\n{_DIV}\n"
         f"{prev_cap_line}"
-        f"Yesterday\n"
-        f"  Trades:   {day_stats['count']}  ({day_stats['wins']}W / {day_stats['losses']}L)\n"
-        f"  Net PnL:  ${day_stats['net_pnl']:+.2f}\n"
-        f"{pf_line}"
-        f"{r_line}"
-        f"{best_line}"
-        f"{worst_line}"
+        f"{trade_lines}"
+        f"{_DIV}\n"
+        f"Total Trades:   {day_stats['count']}\n"
+        f"Winning Trades: {day_stats['wins']} 🔥\n"
+        f"Net PnL:        ${day_stats['net_pnl']:+.2f}\n"
+        f"Win Rate:       {day_stats['win_rate']:.0f}%\n"
         f"{blocked_line}"
         f"{_DIV}\n"
         f"Week-to-date\n"
@@ -572,7 +625,7 @@ def msg_daily_report(
         f"  {_mini_stats(mtd_stats)}\n"
         f"{_DIV}\n"
         f"{open_line}"
-        f"London session opens at 16:00 SGT\n"
+        f"London opens at 16:00 SGT\n"
         f"Report: {report_time}"
     )
 

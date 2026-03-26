@@ -820,6 +820,10 @@ def backfill_pnl(history: list, trader, alert, settings: dict) -> list:
                                 session=trade.get("session", ""),
                                 demo=demo,
                                 duration_str=_dur,
+                                trades_today=len(get_closed_trade_records_today(history, today_str)),
+                                wins_today=sum(1 for t in get_closed_trade_records_today(history, today_str) if isinstance(t.get("realized_pnl_usd"), (int, float)) and t["realized_pnl_usd"] > 0),
+                                losses_today=sum(1 for t in get_closed_trade_records_today(history, today_str) if isinstance(t.get("realized_pnl_usd"), (int, float)) and t["realized_pnl_usd"] < 0),
+                                pnl_today=sum(t.get("realized_pnl_usd", 0) for t in get_closed_trade_records_today(history, today_str) if isinstance(t.get("realized_pnl_usd"), (int, float))),
                             ))
                             trade["closed_alert_sent"] = True
                         except Exception as _e:

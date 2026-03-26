@@ -313,6 +313,18 @@ def send_daily_report() -> None:
         except Exception:
             pass
 
+        # Build numbered trade list for AtomicFX-style daily report (v1.5)
+        trade_list = []
+        for t in sorted(pd_trades, key=lambda x: x.get("closed_at_sgt") or x.get("timestamp_sgt") or ""):
+            pnl = t.get("realized_pnl_usd", 0) or 0
+            pts = round(abs((t.get("close_price") or 0) - (t.get("entry") or 0)), 2) if t.get("close_price") and t.get("entry") else None
+            trade_list.append({
+                "direction": t.get("direction", "?"),
+                "pnl":       pnl,
+                "pts":       pts,
+                "breakeven": t.get("breakeven_moved", False),
+            })
+
         msg = msg_daily_report(
             day_label       = pd_label,
             day_stats       = pd_stats,
@@ -323,6 +335,7 @@ def send_daily_report() -> None:
             blocked_spread  = blocked_spread,
             blocked_news    = blocked_news,
             blocked_signal  = blocked_signal,
+            trade_list      = trade_list,
         )
         ok = TelegramAlert().send(msg)
         if ok:
