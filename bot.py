@@ -1316,6 +1316,19 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
     cpr_w = levels.get("cpr_width_pct", 0)
 
     def _send_signal_update(decision, reason, extra_payload=None):
+        # v1.7.1 — suppress low-score WATCHING alerts to reduce Telegram noise.
+        # Rule: skip the Telegram send when decision == "WATCHING" AND
+        #   - direction is NONE (no EMA signal at all), OR
+        #   - score is below signal_threshold (watching but not close to trade)
+        # All other decisions (BLOCKED, READY) and score-at-threshold always send.
+        # The log + runtime state are still updated every cycle regardless.
+        _min_score_to_alert = int(settings.get("signal_threshold", 4))
+        _suppress = (
+            decision == "WATCHING"
+            and (direction == "NONE" or score < _min_score_to_alert)
+        )
+        if _suppress:
+            return
         payload = _signal_payload(score=score, direction=direction, **(extra_payload or {}))
         msg = msg_signal_update(
             banner=banner, session=session, direction=direction,
