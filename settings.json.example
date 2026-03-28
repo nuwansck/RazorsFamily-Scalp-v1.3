@@ -1,5 +1,5 @@
 {
-  "bot_name": "RF Scalp v1.6",
+  "bot_name": "RF Scalp v1.7",
   "demo_mode": true,
   "trade_gold": true,
   "enabled": true,
@@ -17,8 +17,8 @@
   "margin_safety_factor": 0.6,
   "max_concurrent_trades": 1,
   "max_trades_day": 10,
-  "max_losing_trades_day": 5,
-  "max_trades_london": 4,
+  "max_losing_trades_day": 8,
+  "max_trades_london": 10,
   "max_trades_us": 10,
   "loss_streak_cooldown_min": 30,
   "sl_reentry_gap_min": 10,
@@ -40,7 +40,7 @@
   "friday_cutoff_hour_sgt": 23,
   "friday_cutoff_minute_sgt": 0,
   "account_balance_override": 0,
-  "cycle_minutes": 15,
+  "cycle_minutes": 5,
   "db_retention_days": 90,
   "db_cleanup_hour_sgt": 0,
   "db_cleanup_minute_sgt": 15,
@@ -56,7 +56,7 @@
   "telegram_show_margin": true,
   "xau_margin_rate_override": 0.05,
   "trading_day_start_hour_sgt": 8,
-  "max_losing_trades_session": 2,
+  "max_losing_trades_session": 4,
   "exhaustion_atr_mult": 3.0,
   "orb_fresh_minutes": 60,
   "orb_aging_minutes": 120,
@@ -74,5 +74,5 @@
   "atr_period": 14,
   "m5_candle_count": 40,
   "consecutive_sl_block_count": 2,
-  "consecutive_sl_block_minutes": 90
+  "consecutive_sl_block_minutes": 120
 }

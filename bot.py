@@ -184,7 +184,7 @@ def validate_settings(settings: dict) -> dict:
     settings.setdefault("loss_streak_cooldown_min",  30)
 
     settings.setdefault("consecutive_sl_block_count",   2)   # v1.4: direction block
-    settings.setdefault("consecutive_sl_block_minutes", 60)  # v1.4: direction block duration
+    settings.setdefault("consecutive_sl_block_minutes", 120) # v1.7: extended from 60
     # v1.2.6: ORB decay + parameterized signal engine values
     settings.setdefault("orb_fresh_minutes",         60)
     settings.setdefault("orb_aging_minutes",         120)
@@ -1359,35 +1359,69 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
         db.finish_cycle(run_id, status="SKIPPED", summary={"stage": "trade_switch"})
         return None
 
-    # ── Consecutive SL direction block (v1.4) ────────────────────────────────
+    # ── Consecutive SL direction block (v1.4, race-condition fix v1.7) ─────────
     # After N consecutive SLs in the same direction, block that direction for
     # a configurable window. This prevents the bot from repeatedly fighting a
     # sustained directional move (e.g. selling into a rising gold market).
     #
-    # Key difference vs loss_streak_cooldown: that guard blocks ALL directions
-    # after any 2 losses. This guard only blocks the specific losing direction —
-    # the opposite direction can still trade if a valid signal fires.
+    # v1.7 race-condition fix: runtime_state is checked FIRST, independently of
+    # the streak calculation. This means:
+    #   1. If a block was set in the previous cycle it is respected immediately
+    #      even if backfill_pnl hasn't yet recorded the triggering SL into history
+    #      (the same-cycle timing race that caused Trade 4 to be placed despite
+    #      a block being active).
+    #   2. If trade history was wiped (new OANDA account) but runtime_state still
+    #      carries a block from the previous session, that block is honoured.
     #
-    # Runs post-signal so direction is known and score has passed the threshold.
     # Settings: consecutive_sl_block_count (default 2)
-    #           consecutive_sl_block_minutes (default 60)
+    #           consecutive_sl_block_minutes (default 120)
     _dir_block_count = int(settings.get("consecutive_sl_block_count", 2))
-    _dir_block_min   = int(settings.get("consecutive_sl_block_minutes", 60))
+    _dir_block_min   = int(settings.get("consecutive_sl_block_minutes", 120))
     if _dir_block_count > 0 and _dir_block_min > 0 and direction not in (None, "NONE"):
         _signal_dir = direction.upper()
+        _block_key  = f"dir_block_{_signal_dir.lower()}"
+        _rt_state   = load_json(RUNTIME_STATE_FILE, {})
+        _block_until = _parse_sgt_timestamp(_rt_state.get(f"{_block_key}_until"))
+
+        # ── Step 1: honour any EXISTING active block from runtime_state ──────
+        # This runs before the streak check so a block set in the previous
+        # 5-min cycle is respected even if history hasn't caught up yet.
+        if _block_until and now_sgt < _block_until:
+            _remaining = max(1, int((_block_until - now_sgt).total_seconds() // 60))
+            _trigger_id = _rt_state.get(f"{_block_key}_trigger", "active")
+            msg = (
+                f"🚫 {_signal_dir} direction blocked — "
+                f"resuming in {_remaining} min."
+            )
+            send_once_per_state(
+                alert, ops, f"dir_block_{_signal_dir.lower()}_state",
+                f"dir_block:{_signal_dir}:{_trigger_id}", msg,
+            )
+            log.info(
+                "Direction block active (runtime_state): %s blocked %d more min.",
+                _signal_dir, _remaining, extra={"run_id": run_id},
+            )
+            update_runtime_state(
+                last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                status="SKIPPED_DIRECTION_BLOCK",
+            )
+            db.finish_cycle(run_id, status="SKIPPED", summary={
+                "stage":     "direction_block",
+                "direction": _signal_dir,
+                "remaining_min": _remaining,
+            })
+            return None
+
+        # ── Step 2: check streak and set NEW block if threshold reached ───────
         _dir_streak = consecutive_sl_direction_streak(history, today, _signal_dir)
         if _dir_streak >= _dir_block_count:
-            _rt_state    = load_json(RUNTIME_STATE_FILE, {})
-            _block_key   = f"dir_block_{_signal_dir.lower()}"
-            _block_until = _parse_sgt_timestamp(_rt_state.get(f"{_block_key}_until"))
-
             _last_closed = get_closed_trade_records_today(history, today)
             _trigger_id  = (
                 _last_closed[-1].get("trade_id")
                 or _last_closed[-1].get("closed_at_sgt")
             ) if _last_closed else None
 
-            # Set block window if not already set for this streak trigger
+            # Only set if not already set for this exact trigger
             if _rt_state.get(f"{_block_key}_trigger") != _trigger_id:
                 _block_until = now_sgt + timedelta(minutes=_dir_block_min)
                 save_json(RUNTIME_STATE_FILE, {
@@ -1397,11 +1431,15 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
                     "updated_at_sgt":        now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
                 })
                 log.info(
-                    "Direction block set: %s blocked until %s (%d consecutive SLs).",
+                    "Direction block SET: %s blocked until %s (%d consecutive SLs).",
                     _signal_dir, _block_until.strftime("%H:%M SGT"), _dir_streak,
                     extra={"run_id": run_id},
                 )
 
+            # Re-read the freshly written block_until and skip this cycle
+            _block_until = _parse_sgt_timestamp(
+                load_json(RUNTIME_STATE_FILE, {}).get(f"{_block_key}_until")
+            )
             if _block_until and now_sgt < _block_until:
                 _remaining = max(1, int((_block_until - now_sgt).total_seconds() // 60))
                 msg = (
@@ -1413,7 +1451,7 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
                     f"dir_block:{_signal_dir}:{_trigger_id}", msg,
                 )
                 log.info(
-                    "Direction block active: %s blocked %d more min (%d/%d SLs).",
+                    "Direction block ACTIVE: %s blocked %d more min (%d/%d SLs).",
                     _signal_dir, _remaining, _dir_streak, _dir_block_count,
                     extra={"run_id": run_id},
                 )

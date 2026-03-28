@@ -2,6 +2,65 @@
 
 ---
 
+## v1.7.0 — 2026-03-28
+
+### 🔴 Fix — RR Ratio Restored to 2.5 (`settings.json`)
+
+`rr_ratio` was incorrectly lowered to 2.0 in v1.6. At 2.0 RR the breakeven
+win rate is 33%. At 2.5 RR it is 29%. With current observed WR of 18–20%,
+every fraction of RR matters. Restored to 2.5.
+
+```json
+"rr_ratio": 2.5   // was 2.0 in v1.6
+```
+
+### 🔴 Fix — Direction Block Timing Race Condition (`bot.py`)
+
+**Problem (v1.4–v1.6):** The direction block guard only checked `runtime_state`
+for an active block window **inside** the `if streak >= N` condition. This
+created two failure modes:
+
+1. **Same-cycle race:** Trade 3 (SELL SL) closes at 21:35. `backfill_pnl`
+   records it. The direction block guard runs — streak=2, block set until 22:35.
+   Trade 4 (SELL) fires at 21:52 in the **same 5-min cycle**. Because
+   `backfill_pnl` didn't see Trade 3 as closed yet when the cycle evaluated
+   the signal, streak was only 1 and the block never fired. Trade 4 was placed
+   despite a block being active. This caused the 3rd consecutive SELL SL.
+
+2. **History wipe:** If OANDA account is reset, `trade_history.json` on the
+   volume has no trades. Streak = 0 forever. Any block set in `runtime_state`
+   from a prior session is ignored because the guard never enters the streak
+   check.
+
+**Fix (v1.7):** The guard now runs in **two independent steps**:
+
+```
+Step 1 — check runtime_state FIRST (no streak needed):
+  If dir_block_{direction}_until is in the future → skip immediately
+  This fires even with empty history and even in the same cycle the block was set
+
+Step 2 — check streak and set NEW block:
+  If streak >= consecutive_sl_block_count → write block to runtime_state
+  Then immediately check runtime_state again and skip this cycle too
+```
+
+This means the block is honoured on the **very same cycle it is set**, closing
+the race condition window entirely.
+
+### 🟡 Change — Direction Block Extended to 120 min (`settings.json`)
+
+Extended `consecutive_sl_block_minutes` from 60 to 120. Data showed that on
+sustained trend days, 60 minutes was not enough — the block expired and the
+bot re-entered the same losing direction 90+ minutes later (Trade 8 entered
+1h50m after the block expired). 120 minutes provides a full session-level
+buffer.
+
+```json
+"consecutive_sl_block_minutes": 120   // was 60
+```
+
+---
+
 ## v1.6.0 — 2026-03-26
 
 ### Win-rate accuracy overhaul — 5 targeted fixes
